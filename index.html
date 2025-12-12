@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RGB 3D Plot & K-Means</title>
+  <!-- Map bare module specifier 'three' to the CDN module so examples/jsm can import 'three' -->
+  <script type="importmap">
+    {"imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" }}
+  </script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #ui { padding: 12px; background: #eee; }
+    #renderer { width: 100vw; height: 80vh; display: block; }
+    #colors { display: flex; gap: 10px; padding: 10px; align-items:flex-start; }
+    .color-item { display:flex; flex-direction:column; align-items:center; gap:4px; }
+    .color-box { width: 48px; height: 48px; border: 1px solid #000; }
+    .color-label { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <input type="file" id="imageUpload" accept="image/*" />
+    <img id="preview" alt="preview" style="display:none; max-width:200px; margin-left:12px; vertical-align:middle;" />
+    <label>K:</label>
+    <input type="number" id="kValue" min="1" max="100" value="3" />
+    <button id="runKMeans">Run K-Means</button>
+    <button id="exportPalette">Export Palette (JSON)</button>
+    <button id="downloadSwatches">Download Swatches (PNG)</button>
+    <button id="copyHexes">Copy Hexes</button>
+  </div>
+
+  <div id="renderer"></div>
+  <div id="colors"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+    // THREE.js setup
+    const container = document.getElementById('renderer');
+    const scene = new THREE.Scene();
+    // use white background so dark colors are visible
+    scene.background = new THREE.Color(0xffffff);
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / (window.innerHeight * 0.8), 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight * 0.8);
+    renderer.setClearColor(0xffffff, 1);
+    container.appendChild(renderer.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement);
+
+    camera.position.set(200, 200, 200);
+    controls.update();
+
+    // Axes box for RGB 0-255 cube (centered at origin)
+    const cubeGeometry = new THREE.BoxGeometry(255, 255, 255);
+    const cubeMesh = new THREE.Mesh(cubeGeometry, new THREE.MeshBasicMaterial({ wireframe: true, color: 0x000000, opacity: 0.2, transparent: true }));
+    cubeMesh.position.set(0,0,0);
+    scene.add(cubeMesh);
+
+    let points = [];
+    let pointsObject = null; // THREE.Points
+    let lastPaletteGlobal = [];
+
+    function render() { requestAnimationFrame(render); renderer.render(scene, camera); }
+    render();
+
+    // Load image and extract RGB points
+    document.getElementById('imageUpload').addEventListener('change', function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+
+      img.onload = () => {
+        // show preview
+        const preview = document.getElementById('preview');
+        preview.src = img.src;
+        preview.style.display = 'inline-block';
+
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        const data = ctx.getImageData(0, 0, img.width, img.height).data;
+
+        // collect rgb points; subsample if image is large
+        points = [];
+        const maxPoints = 5000;
+        const totalPixels = img.width * img.height;
+        const step = Math.max(1, Math.floor(Math.sqrt(totalPixels / maxPoints)));
+
+        for (let y = 0; y < img.height; y += step) {
+          for (let x = 0; x < img.width; x += step) {
+            const i = (y * img.width + x) * 4;
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+            points.push([r, g, b]);
+          }
+        }
+
+        // remove old points
+        if (pointsObject) {
+          scene.remove(pointsObject);
+          pointsObject.geometry.dispose();
+          pointsObject.material.dispose();
+          pointsObject = null;
+        }
+
+        // create BufferGeometry for points
+        const positions = new Float32Array(points.length * 3);
+        const colors = new Float32Array(points.length * 3);
+        for (let i = 0; i < points.length; i++) {
+          const [r, g, b] = points[i];
+          // center around 0
+          positions[i * 3] = r - 127.5;
+          positions[i * 3 + 1] = g - 127.5;
+          positions[i * 3 + 2] = b - 127.5;
+
+          colors[i * 3] = r / 255;
+          colors[i * 3 + 1] = g / 255;
+          colors[i * 3 + 2] = b / 255;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        const material = new THREE.PointsMaterial({ size: 2.5, vertexColors: true });
+        pointsObject = new THREE.Points(geometry, material);
+        scene.add(pointsObject);
+      };
+    });
+
+    // K-means
+    // Simple K-means implementation (works in-browser)
+    function computeKMeans(data, k, maxIter = 50) {
+      // data: array of [r,g,b]
+      const n = data.length;
+      if (n === 0) return { centroids: [], assignments: [] };
+      // cap k to [1..n] to avoid infinite loops or invalid state
+      k = Math.max(1, Math.min(k, n));
+      // init centroids by random sampling (without replacement)
+      const centroids = [];
+      const used = new Set();
+      const indices = Array.from({length: n}, (_, i) => i);
+      // shuffle indices and take first k
+      for (let i = indices.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+      }
+      for (let i = 0; i < k; i++) centroids.push(data[indices[i]].slice());
+
+      let assignments = new Array(n).fill(-1);
+      for (let iter = 0; iter < maxIter; iter++) {
+        let changed = false;
+        // assign
+        for (let i = 0; i < n; i++) {
+          let best = -1; let bestDist = Infinity;
+          for (let j = 0; j < k; j++) {
+            const dr = data[i][0] - centroids[j][0];
+            const dg = data[i][1] - centroids[j][1];
+            const db = data[i][2] - centroids[j][2];
+            const d = dr*dr + dg*dg + db*db;
+            if (d < bestDist) { bestDist = d; best = j; }
+          }
+          if (assignments[i] !== best) { changed = true; assignments[i] = best; }
+        }
+        if (!changed) break;
+
+        // update centroids
+        const sums = Array.from({length:k}, () => [0,0,0,0]); // r,g,b,count
+        for (let i = 0; i < n; i++) {
+          const a = assignments[i];
+          sums[a][0] += data[i][0];
+          sums[a][1] += data[i][1];
+          sums[a][2] += data[i][2];
+          sums[a][3] += 1;
+        }
+        for (let j = 0; j < k; j++) {
+          if (sums[j][3] > 0) {
+            centroids[j][0] = sums[j][0] / sums[j][3];
+            centroids[j][1] = sums[j][1] / sums[j][3];
+            centroids[j][2] = sums[j][2] / sums[j][3];
+          }
+        }
+      }
+      return { centroids, assignments };
+    }
+
+    document.getElementById('runKMeans').addEventListener('click', function() {
+      const k = parseInt(document.getElementById('kValue').value);
+      if (!points.length) return alert('Upload an image first.');
+
+      const result = computeKMeans(points, k);
+      const colorsDiv = document.getElementById('colors');
+      colorsDiv.innerHTML = '';
+
+      // compute counts and percentages
+      const counts = new Array(result.centroids.length).fill(0);
+      result.assignments.forEach(a => { if (a >= 0) counts[a]++; });
+      const total = result.assignments.length;
+      // store last palette for export
+      const lastPalette = result.centroids.map((c, idx) => {
+        const r = Math.round(c[0]);
+        const g = Math.round(c[1]);
+        const b = Math.round(c[2]);
+        const count = counts[idx] || 0;
+        const percent = total ? (count / total) * 100 : 0;
+        return { r, g, b, count, percent };
+      });
+
+      // render swatches with percentages
+      lastPalette.forEach(p => {
+        const item = document.createElement('div');
+        item.className = 'color-item';
+        const box = document.createElement('div');
+        box.className = 'color-box';
+        box.style.background = `rgb(${p.r},${p.g},${p.b})`;
+        const label = document.createElement('div');
+        label.className = 'color-label';
+        label.textContent = `${p.percent.toFixed(1)}% (${p.count})`;
+        item.appendChild(box);
+        item.appendChild(label);
+        colorsDiv.appendChild(item);
+      });
+
+      // visualize centroids as larger spheres
+      // remove previous centroid markers
+      scene.traverse(obj => { if (obj.userData && obj.userData.isCentroid) scene.remove(obj); });
+      result.centroids.forEach(c => {
+        const [r,g,b] = c;
+        const geo = new THREE.SphereGeometry(4, 12, 12);
+        const mat = new THREE.MeshBasicMaterial({ color: `rgb(${r|0},${g|0},${b|0})` });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(r - 127.5, g - 127.5, b - 127.5);
+        mesh.userData.isCentroid = true;
+        scene.add(mesh);
+      });
+
+      // expose palette for export
+      lastPaletteGlobal = lastPalette;
+    });
+
+    // Export palette JSON
+    document.getElementById('exportPalette').addEventListener('click', () => {
+      if (!lastPaletteGlobal || !lastPaletteGlobal.length) return alert('Run K-Means first.');
+      const data = JSON.stringify(lastPaletteGlobal, null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'palette.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // Download swatches as PNG
+    document.getElementById('downloadSwatches').addEventListener('click', () => {
+      if (!lastPaletteGlobal || !lastPaletteGlobal.length) return alert('Run K-Means first.');
+      const k = lastPaletteGlobal.length;
+      const sw = 100;
+      const canvas = document.createElement('canvas');
+      canvas.width = sw * k;
+      canvas.height = sw;
+      const ctx = canvas.getContext('2d');
+      lastPaletteGlobal.forEach((p, i) => {
+        ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`;
+        ctx.fillRect(i * sw, 0, sw, sw);
+      });
+      canvas.toBlob(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'swatches.png';
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    });
+
+    // Copy hex values to clipboard
+    document.getElementById('copyHexes').addEventListener('click', async () => {
+      if (!lastPaletteGlobal || !lastPaletteGlobal.length) return alert('Run K-Means first.');
+      const hexes = lastPaletteGlobal.map(p => {
+        const toHex = v => v.toString(16).padStart(2, '0');
+        return `#${toHex(p.r)}${toHex(p.g)}${toHex(p.b)}`.toUpperCase();
+      });
+      const text = hexes.join(', ');
+      try {
+        await navigator.clipboard.writeText(text);
+        alert('Copied: ' + text);
+      } catch (err) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        alert('Copied: ' + text);
+      }
+    });
+
+    // make camera look at center and handle resize
+    camera.position.set(350, 350, 350);
+    camera.lookAt(0,0,0);
+    controls.target.set(0,0,0);
+    controls.update();
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight * 0.8;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    });
+  </script>
+</body>
+</html>
